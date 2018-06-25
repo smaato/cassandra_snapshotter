@@ -9,6 +9,7 @@ import sys
 
 # From package
 from .snapshotting import (BackupWorker, RestoreWorker,
+                           RestoreSchemaWorker,
                            Snapshot, SnapshotCollection)
 from .utils import (add_s3_arguments, get_s3_connection_host)
 from .utils import base_parser as _base_parser
@@ -151,6 +152,27 @@ def restore_backup(args):
         target_hosts = None
 
     worker.restore(args.keyspace, args.table, hosts, target_hosts)
+
+
+def restore_schema(args):
+    snapshots = SnapshotCollection(
+        args.aws_access_key_id,
+        args.aws_secret_access_key,
+        args.s3_base_path,
+        args.s3_bucket_name,
+        get_s3_connection_host(args.s3_bucket_region)
+    )
+
+    if args.snapshot_name == 'LATEST':
+        snapshot = snapshots.get_latest()
+    else:
+        snapshot = snapshots.get_snapshot_by_name(args.snapshot_name)
+
+    worker = RestoreSchemaWorker(aws_access_key_id=args.aws_access_key_id,
+                                 aws_secret_access_key=args.aws_secret_access_key,
+                                 snapshot=snapshot)
+
+    worker.restore(args.keyspace, args.table)
 
 
 def main():
@@ -326,6 +348,25 @@ def main():
              "If set, files will just be downloaded. Use it if you want to do "
              "some checks and then run sstableloader manually.")
 
+    restore_parser = subparsers.add_parser(
+        'restore-schema', help="Restores a schema component")
+
+    restore_parser.add_argument(
+        '--snapshot-name',
+        default='LATEST',
+        help="The name (date/time) \
+            of the snapshot (and incrementals) to restore")
+
+    restore_parser.add_argument(
+        '--keyspace',
+        required=True,
+        help="The keyspace to restore, this keyspace must already exist")
+
+    restore_parser.add_argument(
+        '--table',
+        default='',
+        help="The table (column family) to restore; leave blank for all")
+
     args = base_parser.parse_args()
     subcommand = args.subcommand
 
@@ -338,6 +379,8 @@ def main():
         list_backups(args)
     elif subcommand == 'restore':
         restore_backup(args)
+    elif subcommand == 'restore-schema':
+        restore_schema(args)
 
 
 if __name__ == '__main__':

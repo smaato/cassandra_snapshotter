@@ -16,7 +16,7 @@ from datetime import datetime
 from fabric.api import (env, execute, hide, run, sudo)
 from fabric.context_managers import settings
 from multiprocessing.dummy import Pool
-from cassandra_snapshotter.utils import check_lzop, decompression_pipe
+from cassandra_snapshotter.utils import check_lzop, decompression_pipe, decompression_cassandra_pipe
 
 
 class Snapshot(object):
@@ -94,7 +94,16 @@ class Snapshot(object):
     __str__ = __repr__
 
 
-class RestoreWorker(object):
+class AbstractRestoreWorker(object):
+    def _human_size(self, size):
+        for x in ['bytes', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return "{:3.1f}{!s}".format(size, x)
+            size /= 1024.0
+        return "{:3.1f}{!s}".format(size, 'TB')
+
+
+class RestoreWorker(AbstractRestoreWorker):
     def __init__(self, aws_access_key_id, aws_secret_access_key, snapshot,
                  cassandra_bin_dir, restore_dir, no_sstableloader,
                  local_restore):
@@ -243,13 +252,6 @@ class RestoreWorker(object):
 
         return key.size
 
-    def _human_size(self, size):
-        for x in ['bytes', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return "{:3.1f}{!s}".format(size, x)
-            size /= 1024.0
-        return "{:3.1f}{!s}".format(size, 'TB')
-
     def _run_sstableloader(self, keyspace_path, tables, target_hosts, cassandra_bin_dir):
         logging.info("Running sstableloader...")
         sstableloader = "{!s}/sstableloader".format(cassandra_bin_dir)
@@ -262,6 +264,104 @@ class RestoreWorker(object):
                                                     keyspace_path=keyspace_path, table=table)
             logging.info("invoking: {!s}".format(command))
             os.system(command)
+
+class RestoreSchemaWorker(AbstractRestoreWorker):
+    def __init__(self, aws_access_key_id, aws_secret_access_key, snapshot):
+        self.aws_secret_access_key = aws_secret_access_key
+        self.aws_access_key_id = aws_access_key_id
+        self.s3connection = S3Connection(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key)
+        self.snapshot = snapshot
+        self.keyspace_table_matcher = None
+
+    def restore(self, keyspace, table):
+        logging.info("Restoring schema keyspace=%(keyspace)s,\
+            table=%(table)s" % dict(keyspace=keyspace, table=table))
+        if not table:
+            table = ".*?"
+
+        bucket = self.s3connection.get_bucket(
+            self.snapshot.s3_bucket, validate=False)
+
+        matcher_string = ".*/(%(keyspace)s)/(%(table)s-[A-Za-z0-9]*)/.*/schema.cql(\\.lzo)?$" % dict(
+            keyspace=keyspace, table=table)
+        self.keyspace_table_matcher = re.compile(matcher_string)
+
+        keys = []
+        schemas = set()
+
+        for k in bucket.list(self.snapshot.base_path):
+            r = self.keyspace_table_matcher.search(k.name)
+            if not r:
+                continue
+
+            if r.group(2) not in schemas:
+                schemas.add(r.group(2))
+                keys.append(k)
+
+        total_size = reduce(lambda s, k: s + k.size, keys, 0)
+
+        logging.info("Found %(files_count)d schema files, with total size \
+            of %(size)s." % dict(files_count=len(keys),
+                                 size=self._human_size(total_size)))
+        print("Found %(files_count)d schema files, with total size \
+            of %(size)s." % dict(files_count=len(keys),
+                                 size=self._human_size(total_size)))
+
+        self._restore_keys(keys, total_size)
+
+        logging.info("Finished restoring...")
+
+    def _restore_keys(self, keys, total_size, pool_size=5):
+        logging.info("Starting to download...")
+
+        progress_string = ""
+        read_bytes = 0
+
+        thread_pool = Pool(pool_size)
+
+        for size in thread_pool.imap(self._restore_key, keys):
+            old_width = len(progress_string)
+            read_bytes += size
+            progress_string = "{!s} / {!s} ({:.2f})".format(
+                self._human_size(read_bytes),
+                self._human_size(total_size),
+                (read_bytes / float(total_size)) * 100.0)
+            width = len(progress_string)
+            padding = ""
+            if width < old_width:
+                padding = " " * (width - old_width)
+            progress_string = "{!s}{!s}\r".format(progress_string, padding)
+
+            sys.stderr.write(progress_string)
+
+    def _restore_key(self, key):
+        r = self.keyspace_table_matcher.search(key.name)
+
+        if key.name.endswith('.lzo'):
+            print(key.name)
+            cassandra_pipe = decompression_cassandra_pipe()
+            key.open_read()
+            for chunk in key:
+                cassandra_pipe.stdin.write(chunk)
+            key.close()
+            out, err = cassandra_pipe.communicate()
+            errcode = cassandra_pipe.returncode
+            if errcode != 0:
+                logging.exception("lzop/cqlsh Out: %s\nError:%s\nExit Code %d: " % (out, err, errcode))
+        else:
+            cassandra_pipe = cassandra_pipe()
+            key.name.open_read()
+            for chunk in key:
+                cassandra_pipe.stdin.write(chunk)
+            key.close()
+            out, err = cassandra_pipe.communicate()
+            errcode = cassandra_pipe.returncode
+            if errcode != 0:
+                logging.exception("cqlsh Out: %s\nError:%s\nExit Code %d: " % (out, err, errcode))
+
+        return key.size
 
 
 class BackupWorker(object):

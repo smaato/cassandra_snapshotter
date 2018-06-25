@@ -10,6 +10,7 @@ import subprocess
 
 LZOP_BIN = 'lzop'
 PV_BIN = 'pv'
+CQLSH_BIN = 'cqlsh'
 
 S3_CONNECTION_HOSTS = {
     'us-east-1': 's3.amazonaws.com',
@@ -135,5 +136,25 @@ def decompression_pipe(path):
     lzop = subprocess.Popen(
         (LZOP_BIN, '-d', '-o', path),
         stdin=subprocess.PIPE
+    )
+    return lzop
+
+def cassandra_pipe():
+    cqlsh = subprocess.Popen(
+        (CQLSH_BIN),
+        stdin=subprocess.PIPE
+    )
+    return cqlsh
+
+def decompression_cassandra_pipe():
+    lzop = subprocess.Popen(
+        (LZOP_BIN, '-d'),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    
+    cqlsh = subprocess.Popen(
+        (CQLSH_BIN),
+        stdin=lzop.stdout
     )
     return lzop
